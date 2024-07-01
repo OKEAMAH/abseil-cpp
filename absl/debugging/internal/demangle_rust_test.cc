@@ -29,7 +29,7 @@ namespace {
 // chars>, buffer_size) returns true and seems not to have overrun its output
 // buffer, returns the string written by DemangleRustSymbolEncoding; otherwise
 // returns an error message.
-std::string ResultOfDemangling(const char* mangled, std::size_t buffer_size) {
+std::string ResultOfDemangling(const char* mangled, size_t buffer_size) {
   // Fill the buffer with something other than NUL so we test whether Demangle
   // appends trailing NUL as expected.
   std::string buffer(buffer_size + 1, '~');
@@ -58,9 +58,9 @@ std::string ResultOfDemangling(const char* mangled, std::size_t buffer_size) {
 #define EXPECT_DEMANGLING(mangled, plaintext) \
   do { \
     [] { \
-      constexpr std::size_t plenty_of_space = sizeof(plaintext) + 128; \
-      constexpr std::size_t just_enough_space = sizeof(plaintext); \
-      constexpr std::size_t one_byte_too_few = sizeof(plaintext) - 1; \
+      constexpr size_t plenty_of_space = sizeof(plaintext) + 128; \
+      constexpr size_t just_enough_space = sizeof(plaintext); \
+      constexpr size_t one_byte_too_few = sizeof(plaintext) - 1; \
       const char* expected_plaintext = plaintext; \
       const char* expected_error = "Failed parse"; \
       ASSERT_EQ(ResultOfDemangling(mangled, plenty_of_space), \
@@ -76,7 +76,7 @@ std::string ResultOfDemangling(const char* mangled, std::size_t buffer_size) {
 // truncation of a real Rust symbol name).
 #define EXPECT_DEMANGLING_FAILS(mangled) \
     do { \
-      constexpr std::size_t plenty_of_space = 1024; \
+      constexpr size_t plenty_of_space = 1024; \
       const char* expected_error = "Failed parse"; \
       EXPECT_EQ(ResultOfDemangling(mangled, plenty_of_space), expected_error); \
     } while (0)
@@ -117,7 +117,7 @@ TEST(DemangleRust, UnicodeIdentifiers) {
   EXPECT_DEMANGLING("_RNvC7ice_cap17Eyjafjallajökull",
                     "ice_cap::Eyjafjallajökull");
   EXPECT_DEMANGLING("_RNvC7ice_caps_u19Eyjafjallajkull_jtb",
-                    "ice_cap::{Punycode Eyjafjallajkull_jtb}");
+                    "ice_cap::Eyjafjallajökull");
 }
 
 TEST(DemangleRust, FunctionInModule) {
@@ -476,6 +476,106 @@ TEST(DemangleRust, TraitImplWithDisambiguator) {
 TEST(DemangleRust, TraitImplWithNonpathSelfType) {
   EXPECT_DEMANGLING("_RNvXC8my_crateRlNtB2_8my_trait7my_func",
                     "<&i32 as my_crate::my_trait>::my_func");
+}
+
+TEST(DemangleRust, ThunkType) {
+  EXPECT_DEMANGLING("_RNvYFEuNtC1c1t1f",  // <fn() as c::t>::f
+                    "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, NontrivialFunctionReturnType) {
+  EXPECT_DEMANGLING(
+      "_RNvYFERTlmENtC1c1t1f",  // <fn() -> &(i32, u32) as c::t>::f
+      "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, OneParameterType) {
+  EXPECT_DEMANGLING("_RNvYFlEuNtC1c1t1f",  // <fn(i32) as c::t>::f
+                    "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, TwoParameterTypes) {
+  EXPECT_DEMANGLING("_RNvYFlmEuNtC1c1t1f",  // <fn(i32, u32) as c::t>::f
+                    "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, ExternC) {
+  EXPECT_DEMANGLING("_RNvYFKCEuNtC1c1t1f",  // <extern "C" fn() as c::t>>::f
+                    "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, ExternOther) {
+  EXPECT_DEMANGLING(
+      "_RNvYFK5not_CEuNtC1c1t1f",  // <extern "not-C" fn() as c::t>::f
+      "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, Unsafe) {
+  EXPECT_DEMANGLING("_RNvYFUEuNtC1c1t1f",  // <unsafe fn() as c::t>::f
+                    "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, Binder) {
+  EXPECT_DEMANGLING(
+      // <for<'a> fn(&'a i32) -> &'a i32 as c::t>::f
+      "_RNvYFG_RL0_lEB5_NtC1c1t1f",
+      "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, AllFnSigFeaturesInOrder) {
+  EXPECT_DEMANGLING(
+      // <for<'a> unsafe extern "C" fn(&'a i32) -> &'a i32 as c::t>::f
+      "_RNvYFG_UKCRL0_lEB8_NtC1c1t1f",
+      "<fn... as c::t>::f");
+}
+
+TEST(DemangleRust, LifetimeInGenericArgs) {
+  EXPECT_DEMANGLING("_RINvC1c1fINtB2_1sL_EE",  // c::f::<c::s::<'_>>
+                    "c::f::<>");
+}
+
+TEST(DemangleRust, EmptyDynTrait) {
+  // This shouldn't happen, but the grammar allows it and existing demanglers
+  // accept it.
+  EXPECT_DEMANGLING("_RNvYDEL_NtC1c1t1f",
+                    "<dyn  as c::t>::f");
+}
+
+TEST(DemangleRust, SimpleDynTrait) {
+  EXPECT_DEMANGLING("_RNvYDNtC1c1tEL_NtC1d1u1f",
+                    "<dyn c::t as d::u>::f");
+}
+
+TEST(DemangleRust, DynTraitWithOneAssociatedType) {
+  EXPECT_DEMANGLING(
+      "_RNvYDNtC1c1tp1xlEL_NtC1d1u1f",  // <dyn c::t<x = i32> as d::u>::f
+      "<dyn c::t<> as d::u>::f");
+}
+
+TEST(DemangleRust, DynTraitWithTwoAssociatedTypes) {
+  EXPECT_DEMANGLING(
+      // <dyn c::t<x = i32, y = u32> as d::u>::f
+      "_RNvYDNtC1c1tp1xlp1ymEL_NtC1d1u1f",
+      "<dyn c::t<> as d::u>::f");
+}
+
+TEST(DemangleRust, DynTraitPlusAutoTrait) {
+  EXPECT_DEMANGLING(
+      "_RNvYDNtC1c1tNtNtC3std6marker4SendEL_NtC1d1u1f",
+      "<dyn c::t + std::marker::Send as d::u>::f");
+}
+
+TEST(DemangleRust, DynTraitPlusTwoAutoTraits) {
+  EXPECT_DEMANGLING(
+      "_RNvYDNtC1c1tNtNtC3std6marker4CopyNtBc_4SyncEL_NtC1d1u1f",
+      "<dyn c::t + std::marker::Copy + std::marker::Sync as d::u>::f");
+}
+
+TEST(DemangleRust, HigherRankedDynTrait) {
+  EXPECT_DEMANGLING(
+      // <dyn for<'a> c::t::<&'a i32> as d::u>::f
+      "_RNvYDG_INtC1c1tRL0_lEEL_NtC1d1u1f",
+      "<dyn c::t::<> as d::u>::f");
 }
 
 }  // namespace

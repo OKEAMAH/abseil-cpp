@@ -21,6 +21,7 @@
 
 #include "absl/base/attributes.h"
 #include "absl/base/config.h"
+#include "absl/debugging/internal/decode_rust_punycode.h"
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
@@ -260,12 +261,12 @@ class RustSymbolParser {
           if (Eat('T')) goto tuple_type;
           if (Eat('R')) {
             if (!Emit("&")) return false;
-            if (Eat('L')) return false;  // lifetime not yet implemented
+            if (!ParseOptionalLifetime()) return false;
             goto type;
           }
           if (Eat('Q')) {
             if (!Emit("&mut ")) return false;
-            if (Eat('L')) return false;  // lifetime not yet implemented
+            if (!ParseOptionalLifetime()) return false;
             goto type;
           }
           if (Eat('P')) {
@@ -276,8 +277,8 @@ class RustSymbolParser {
             if (!Emit("*mut ")) return false;
             goto type;
           }
-          if (Eat('F')) return false;  // fn-type not yet implemented
-          if (Eat('D')) return false;  // dyn-trait-type not yet implemented
+          if (Eat('F')) goto fn_type;
+          if (Eat('D')) goto dyn_trait_type;
           if (Eat('B')) goto type_backref;
           goto path;
 
@@ -326,6 +327,75 @@ class RustSymbolParser {
             ABSL_DEMANGLER_RECURSE(type, kAfterSubsequentTupleElement);
           }
           --silence_depth_;
+          continue;
+
+        // fn-type -> F fn-sig (F already consumed)
+        // fn-sig -> binder? U? (K abi)? type* E type
+        // abi -> C | undisambiguated-identifier
+        //
+        // We follow the C++ demangler in suppressing details of function
+        // signatures.  Every function type is rendered "fn...".
+        fn_type:
+          if (!Emit("fn...")) return false;
+          ++silence_depth_;
+          if (!ParseOptionalBinder()) return false;
+          (void)Eat('U');
+          if (Eat('K')) {
+            if (!Eat('C') && !ParseUndisambiguatedIdentifier()) return false;
+          }
+          while (!Eat('E')) {
+            ABSL_DEMANGLER_RECURSE(type, kContinueParameterList);
+          }
+          ABSL_DEMANGLER_RECURSE(type, kFinishFn);
+          --silence_depth_;
+          continue;
+
+        // dyn-trait-type -> D dyn-bounds lifetime (D already consumed)
+        // dyn-bounds -> binder? dyn-trait* E
+        //
+        // The grammar strangely allows an empty trait list, even though the
+        // compiler should never output one.  We follow existing demanglers in
+        // rendering DEL_ as "dyn ".
+        //
+        // Because auto traits lengthen a type name considerably without
+        // providing much value to a search for related source code, it would be
+        // desirable to abbreviate
+        //     dyn main::Trait + std::marker::Copy + std::marker::Send
+        // to
+        //     dyn main::Trait + ...,
+        // eliding the auto traits.  But it is difficult to do so correctly, in
+        // part because there is no guarantee that the mangling will list the
+        // main trait first.  So we just print all the traits in their order of
+        // appearance in the mangled name.
+        dyn_trait_type:
+          if (!Emit("dyn ")) return false;
+          if (!ParseOptionalBinder()) return false;
+          if (!Eat('E')) {
+            ABSL_DEMANGLER_RECURSE(dyn_trait, kBeginAutoTraits);
+            while (!Eat('E')) {
+              if (!Emit(" + ")) return false;
+              ABSL_DEMANGLER_RECURSE(dyn_trait, kContinueAutoTraits);
+            }
+          }
+          if (!ParseRequiredLifetime()) return false;
+          continue;
+
+        // dyn-trait -> path dyn-trait-assoc-binding*
+        // dyn-trait-assoc-binding -> p undisambiguated-identifier type
+        //
+        // We render nonempty binding lists as <>, omitting their contents as
+        // for generic-args.
+        dyn_trait:
+          ABSL_DEMANGLER_RECURSE(path, kContinueDynTrait);
+          if (Peek() == 'p') {
+            if (!Emit("<>")) return false;
+            ++silence_depth_;
+            while (Eat('p')) {
+              if (!ParseUndisambiguatedIdentifier()) return false;
+              ABSL_DEMANGLER_RECURSE(type, kContinueAssocBinding);
+            }
+            --silence_depth_;
+          }
           continue;
 
         // const -> type const-data | p | backref
@@ -386,7 +456,10 @@ class RustSymbolParser {
 
         // generic-arg -> lifetime | type | K const
         generic_arg:
-          if (Eat('L')) return false;  // lifetime not yet implemented
+          if (Peek() == 'L') {
+            if (!ParseOptionalLifetime()) return false;
+            continue;
+          }
           if (Eat('K')) goto constant;
           goto type;
 
@@ -431,7 +504,7 @@ class RustSymbolParser {
 
  private:
   // Enumerates resumption points for ABSL_DEMANGLER_RECURSE calls.
-  enum ReturnAddress : std::uint8_t {
+  enum ReturnAddress : uint8_t {
     kInstantiatingCrate,
     kVendorSpecificSuffix,
     kIdentifierInUppercaseNamespace,
@@ -451,6 +524,12 @@ class RustSymbolParser {
     kAfterSecondTupleElement,
     kAfterThirdTupleElement,
     kAfterSubsequentTupleElement,
+    kContinueParameterList,
+    kFinishFn,
+    kBeginAutoTraits,
+    kContinueAutoTraits,
+    kContinueDynTrait,
+    kContinueAssocBinding,
     kConstData,
     kBeginGenericArgList,
     kContinueGenericArgList,
@@ -507,9 +586,9 @@ class RustSymbolParser {
   // false if not everything fit into the output buffer.
   ABSL_MUST_USE_RESULT bool Emit(const char* token) {
     if (silence_depth_ > 0) return true;
-    const std::size_t token_length = std::strlen(token);
-    const std::size_t bytes_to_copy = token_length + 1;  // token and final NUL
-    if (static_cast<std::size_t>(out_end_ - out_) < bytes_to_copy) return false;
+    const size_t token_length = std::strlen(token);
+    const size_t bytes_to_copy = token_length + 1;  // token and final NUL
+    if (static_cast<size_t>(out_end_ - out_) < bytes_to_copy) return false;
     std::memcpy(out_, token, bytes_to_copy);
     out_ += token_length;
     return true;
@@ -526,7 +605,7 @@ class RustSymbolParser {
     // because 999 > 256.  The bound will remain correct even if future
     // maintenance changes the type of the disambiguator variable.
     char digits[3 * sizeof(disambiguator)] = {};
-    std::size_t leading_digit_index = sizeof(digits) - 1;
+    size_t leading_digit_index = sizeof(digits) - 1;
     for (; disambiguator > 0; disambiguator /= 10) {
       digits[--leading_digit_index] =
           static_cast<char>('0' + disambiguator % 10);
@@ -612,19 +691,39 @@ class RustSymbolParser {
     int disambiguator = 0;
     if (!ParseDisambiguator(disambiguator)) return false;
 
+    return ParseUndisambiguatedIdentifier(uppercase_namespace, disambiguator);
+  }
+
+  // Consumes from the input an identifier with no preceding disambiguator,
+  // returning true on success.
+  //
+  // When ParseIdentifier calls this, it passes the N<namespace> character and
+  // disambiguator value so that "{closure#42}" and similar forms can be
+  // rendered correctly.
+  //
+  // At other appearances of undisambiguated-identifier in the grammar, this
+  // treatment is not applicable, and the call site omits both arguments.
+  ABSL_MUST_USE_RESULT bool ParseUndisambiguatedIdentifier(
+      char uppercase_namespace = '\0', int disambiguator = 0) {
     // undisambiguated-identifier -> u? decimal-number _? bytes
     const bool is_punycoded = Eat('u');
     if (!IsDigit(Peek())) return false;
     int num_bytes = 0;
     if (!ParseDecimalNumber(num_bytes)) return false;
     (void)Eat('_');  // optional separator, needed if a digit follows
+    if (is_punycoded) {
+      DecodeRustPunycodeOptions options;
+      options.punycode_begin = &encoding_[pos_];
+      options.punycode_end = &encoding_[pos_] + num_bytes;
+      options.out_begin = out_;
+      options.out_end = out_end_;
+      out_ = DecodeRustPunycode(options);
+      if (out_ == nullptr) return false;
+      pos_ += static_cast<size_t>(num_bytes);
+    }
 
     // Emit the beginnings of braced forms like {shim:vtable#0}.
-    if (uppercase_namespace == '\0') {
-      // Decoding of Punycode is not yet implemented.  For now we emit
-      // "{Punycode ...}" with the raw encoding inside.
-      if (is_punycoded && !Emit("{Punycode ")) return false;
-    } else {
+    if (uppercase_namespace != '\0') {
       switch (uppercase_namespace) {
         case 'C':
           if (!Emit("{closure")) return false;
@@ -640,24 +739,24 @@ class RustSymbolParser {
     }
 
     // Emit the name itself.
-    for (int i = 0; i < num_bytes; ++i) {
-      const char c = Take();
-      if (!IsIdentifierChar(c) &&
-          // The spec gives toolchains the choice of Punycode or raw UTF-8 for
-          // identifiers containing code points above 0x7f, so accept bytes with
-          // the high bit set if this is not a u... encoding.
-          (is_punycoded || (c & 0x80) == 0)) {
-        return false;
+    if (!is_punycoded) {
+      for (int i = 0; i < num_bytes; ++i) {
+        const char c = Take();
+        if (!IsIdentifierChar(c) &&
+            // The spec gives toolchains the choice of Punycode or raw UTF-8 for
+            // identifiers containing code points above 0x7f, so accept bytes
+            // with the high bit set.
+            (c & 0x80) == 0) {
+          return false;
+        }
+        if (!EmitChar(c)) return false;
       }
-      if (!EmitChar(c)) return false;
     }
 
-    // Emit the endings of braced forms: "#42}" or "}".
+    // Emit the endings of braced forms, e.g., "#42}".
     if (uppercase_namespace != '\0') {
       if (!EmitChar('#')) return false;
       if (!EmitDisambiguator(disambiguator)) return false;
-    }
-    if (uppercase_namespace != '\0' || is_punycoded) {
       if (!EmitChar('}')) return false;
     }
 
@@ -684,6 +783,37 @@ class RustSymbolParser {
     if (IsDigit(Peek())) return false;  // too big
     value = encoded_number;
     return true;
+  }
+
+  // Consumes a binder of higher-ranked lifetimes if one is present.  On success
+  // returns true and discards the encoded lifetime count.  On parse failure
+  // returns false.
+  ABSL_MUST_USE_RESULT bool ParseOptionalBinder() {
+    // binder -> G base-62-number
+    if (!Eat('G')) return true;
+    int ignored_binding_count;
+    return ParseBase62Number(ignored_binding_count);
+  }
+
+  // Consumes a lifetime if one is present.
+  //
+  // On success returns true and discards the lifetime index.  We do not print
+  // or even range-check lifetimes because they are a finer detail than other
+  // things we omit from output, such as the entire contents of generic-args.
+  //
+  // On parse failure returns false.
+  ABSL_MUST_USE_RESULT bool ParseOptionalLifetime() {
+    // lifetime -> L base-62-number
+    if (!Eat('L')) return true;
+    int ignored_de_bruijn_index;
+    return ParseBase62Number(ignored_de_bruijn_index);
+  }
+
+  // Consumes a lifetime just like ParseOptionalLifetime, but returns false if
+  // there is no lifetime here.
+  ABSL_MUST_USE_RESULT bool ParseRequiredLifetime() {
+    if (Peek() != 'L') return false;
+    return ParseOptionalLifetime();
   }
 
   // Pushes ns onto the namespace stack and returns true if the stack is not
@@ -786,7 +916,7 @@ class RustSymbolParser {
 }  // namespace
 
 bool DemangleRustSymbolEncoding(const char* mangled, char* out,
-                                std::size_t out_size) {
+                                size_t out_size) {
   return RustSymbolParser(mangled, out, out + out_size).Parse();
 }
 
